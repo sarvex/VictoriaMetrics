@@ -18,7 +18,6 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bloomfilter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
@@ -28,10 +27,10 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/snapshot"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storagepacelimiter"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timerpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/uint64set"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 	"github.com/VictoriaMetrics/fastcache"
+	"github.com/VictoriaMetrics/metricsql"
 )
 
 const (
@@ -45,10 +44,6 @@ type Storage struct {
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/212 .
 	tooSmallTimestampRows uint64
 	tooBigTimestampRows   uint64
-
-	addRowsConcurrencyLimitReached uint64
-	addRowsConcurrencyLimitTimeout uint64
-	addRowsConcurrencyDroppedRows  uint64
 
 	slowRowInserts         uint64
 	slowPerDayIndexInserts uint64
@@ -176,7 +171,8 @@ func OpenStorage(path string, retentionMsecs int64, maxHourlySeries, maxDailySer
 	// Protect from concurrent opens.
 	flockF, err := fs.CreateFlockFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot create lock file in %q; "+
+			"make sure the dir isn't used by other processes or manually delete the file if you recover from abrupt VictoriaMetrics crash; error: %w", path, err)
 	}
 	s.flockF = flockF
 
@@ -306,7 +302,7 @@ func (s *Storage) updateDeletedMetricIDs(metricIDs *uint64set.Set) {
 
 // DebugFlush flushes recently added storage data, so it becomes visible to search.
 func (s *Storage) DebugFlush() {
-	s.tb.flushRawRows()
+	s.tb.flushPendingRows()
 	s.idb().tb.DebugFlush()
 }
 
@@ -378,13 +374,13 @@ func (s *Storage) ListSnapshots() ([]string, error) {
 	snapshotsPath := s.path + "/snapshots"
 	d, err := os.Open(snapshotsPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open %q: %w", snapshotsPath, err)
+		return nil, fmt.Errorf("cannot open snapshots directory: %w", err)
 	}
 	defer fs.MustClose(d)
 
 	fnames, err := d.Readdirnames(-1)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read contents of %q: %w", snapshotsPath, err)
+		return nil, fmt.Errorf("cannot read snapshots directory at %q: %w", snapshotsPath, err)
 	}
 	snapshotNames := make([]string, 0, len(fnames))
 	for _, fname := range fnames {
@@ -449,12 +445,6 @@ type Metrics struct {
 
 	TooSmallTimestampRows uint64
 	TooBigTimestampRows   uint64
-
-	AddRowsConcurrencyLimitReached uint64
-	AddRowsConcurrencyLimitTimeout uint64
-	AddRowsConcurrencyDroppedRows  uint64
-	AddRowsConcurrencyCapacity     uint64
-	AddRowsConcurrencyCurrent      uint64
 
 	SearchDelays uint64
 
@@ -526,12 +516,6 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 
 	m.TooSmallTimestampRows += atomic.LoadUint64(&s.tooSmallTimestampRows)
 	m.TooBigTimestampRows += atomic.LoadUint64(&s.tooBigTimestampRows)
-
-	m.AddRowsConcurrencyLimitReached += atomic.LoadUint64(&s.addRowsConcurrencyLimitReached)
-	m.AddRowsConcurrencyLimitTimeout += atomic.LoadUint64(&s.addRowsConcurrencyLimitTimeout)
-	m.AddRowsConcurrencyDroppedRows += atomic.LoadUint64(&s.addRowsConcurrencyDroppedRows)
-	m.AddRowsConcurrencyCapacity = uint64(cap(addRowsConcurrencyCh))
-	m.AddRowsConcurrencyCurrent = uint64(len(addRowsConcurrencyCh))
 
 	m.SearchDelays = storagepacelimiter.Search.DelaysTotal()
 
@@ -613,7 +597,7 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 // SetFreeDiskSpaceLimit sets the minimum free disk space size of current storage path
 //
 // The function must be called before opening or creating any storage.
-func SetFreeDiskSpaceLimit(bytes int) {
+func SetFreeDiskSpaceLimit(bytes int64) {
 	freeDiskSpaceLimitBytes = uint64(bytes)
 }
 
@@ -1379,7 +1363,7 @@ func getRegexpForGraphiteQuery(q string) (*regexp.Regexp, error) {
 		return nil, fmt.Errorf("unexpected tail left after parsing %q: %q", q, tail)
 	}
 	reStr := "^" + strings.Join(parts, "") + "$"
-	return regexp.Compile(reStr)
+	return metricsql.CompileRegexp(reStr)
 }
 
 func getRegexpPartsForGraphiteQuery(q string) ([]string, string) {
@@ -1520,36 +1504,12 @@ func (s *Storage) ForceMergePartitions(partitionNamePrefix string) error {
 var rowsAddedTotal uint64
 
 // AddRows adds the given mrs to s.
+//
+// The caller should limit the number of concurrent AddRows calls to the number
+// of available CPU cores in order to limit memory usage.
 func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 	if len(mrs) == 0 {
 		return nil
-	}
-
-	// Limit the number of concurrent goroutines that may add rows to the storage.
-	// This should prevent from out of memory errors and CPU thrashing when too many
-	// goroutines call AddRows.
-	select {
-	case addRowsConcurrencyCh <- struct{}{}:
-	default:
-		// Sleep for a while until giving up
-		atomic.AddUint64(&s.addRowsConcurrencyLimitReached, 1)
-		t := timerpool.Get(addRowsTimeout)
-
-		// Prioritize data ingestion over concurrent searches.
-		storagepacelimiter.Search.Inc()
-
-		select {
-		case addRowsConcurrencyCh <- struct{}{}:
-			timerpool.Put(t)
-			storagepacelimiter.Search.Dec()
-		case <-t.C:
-			timerpool.Put(t)
-			storagepacelimiter.Search.Dec()
-			atomic.AddUint64(&s.addRowsConcurrencyLimitTimeout, 1)
-			atomic.AddUint64(&s.addRowsConcurrencyDroppedRows, uint64(len(mrs)))
-			return fmt.Errorf("cannot add %d rows to storage in %s, since it is overloaded with %d concurrent writers; add more CPUs or reduce load",
-				len(mrs), addRowsTimeout, cap(addRowsConcurrencyCh))
-		}
 	}
 
 	// Add rows to the storage in blocks with limited size in order to reduce memory usage.
@@ -1573,8 +1533,6 @@ func (s *Storage) AddRows(mrs []MetricRow, precisionBits uint8) error {
 		atomic.AddUint64(&rowsAddedTotal, uint64(len(mrsBlock)))
 	}
 	putMetricRowsInsertCtx(ic)
-
-	<-addRowsConcurrencyCh
 
 	return firstErr
 }
@@ -1606,14 +1564,6 @@ func putMetricRowsInsertCtx(ic *metricRowsInsertCtx) {
 var metricRowsInsertCtxPool sync.Pool
 
 const maxMetricRowsPerBlock = 8000
-
-var (
-	// Limit the concurrency for data ingestion to GOMAXPROCS, since this operation
-	// is CPU bound, so there is no sense in running more than GOMAXPROCS concurrent
-	// goroutines on data ingestion path.
-	addRowsConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
-	addRowsTimeout       = 30 * time.Second
-)
 
 // RegisterMetricNames registers all the metric names from mns in the indexdb, so they can be queried later.
 //
@@ -2070,12 +2020,7 @@ func (s *Storage) updatePerDateData(rows []rawRow, mrs []*MetricRow) error {
 				continue
 			}
 			mn.sortTags()
-			if err := is.createPerDayIndexes(date, metricID, mn); err != nil {
-				if firstError == nil {
-					firstError = fmt.Errorf("error when storing per-date inverted index for (date=%s, metricID=%d): %w", dateToString(date), metricID, err)
-				}
-				continue
-			}
+			is.createPerDayIndexes(date, metricID, mn)
 		}
 		dateMetricIDsForCache = append(dateMetricIDsForCache, dateMetricID{
 			date:     date,
@@ -2309,7 +2254,7 @@ func (s *Storage) updateNextDayMetricIDs(date uint64) {
 	if e.date == date {
 		pendingMetricIDs.Union(&e.v)
 	} else {
-		// Do not add pendingMetricIDs from the previous day to the cyrrent day,
+		// Do not add pendingMetricIDs from the previous day to the current day,
 		// since this may result in missing registration of the metricIDs in the per-day inverted index.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3309
 		pendingMetricIDs = &uint64set.Set{}
@@ -2337,14 +2282,15 @@ func (s *Storage) updateCurrHourMetricIDs(hour uint64) {
 	var m *uint64set.Set
 	if hm.hour == hour {
 		m = hm.m.Clone()
-	} else {
-		m = &uint64set.Set{}
-	}
-	if hour%24 != 0 {
-		// Do not add pending metricIDs from the previous hour to the current hour on the next day,
-		// since this may result in missing registration of the metricIDs in the per-day inverted index.
-		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3309
 		m.Union(newMetricIDs)
+	} else {
+		m = newMetricIDs
+		if hour%24 == 0 {
+			// Do not add pending metricIDs from the previous hour to the current hour on the next day,
+			// since this may result in missing registration of the metricIDs in the per-day inverted index.
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3309
+			m = &uint64set.Set{}
+		}
 	}
 	hmNew := &hourMetricIDs{
 		m:    m,

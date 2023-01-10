@@ -15,16 +15,13 @@ import (
 var (
 	unparsedLabelsGlobal = flagutil.NewArrayString("remoteWrite.label", "Optional label in the form 'name=value' to add to all the metrics before sending them to -remoteWrite.url. "+
 		"Pass multiple -remoteWrite.label flags in order to add multiple labels to metrics before sending them to remote storage")
-	relabelConfigPathGlobal = flag.String("remoteWrite.relabelConfig", "", "Optional path to file with relabel_config entries. "+
-		"The path can point either to local file or to http url. These entries are applied to all the metrics "+
-		"before sending them to -remoteWrite.url. See https://docs.victoriametrics.com/vmagent.html#relabeling for details")
-	relabelDebugGlobal = flag.Bool("remoteWrite.relabelDebug", false, "Whether to log metrics before and after relabeling with -remoteWrite.relabelConfig. "+
-		"If the -remoteWrite.relabelDebug is enabled, then the metrics aren't sent to remote storage. This is useful for debugging the relabeling configs")
-	relabelConfigPaths = flagutil.NewArrayString("remoteWrite.urlRelabelConfig", "Optional path to relabel config for the corresponding -remoteWrite.url. "+
-		"The path can point either to local file or to http url")
-	relabelDebug = flagutil.NewArrayBool("remoteWrite.urlRelabelDebug", "Whether to log metrics before and after relabeling with -remoteWrite.urlRelabelConfig. "+
-		"If the -remoteWrite.urlRelabelDebug is enabled, then the metrics aren't sent to the corresponding -remoteWrite.url. "+
-		"This is useful for debugging the relabeling configs")
+	relabelConfigPathGlobal = flag.String("remoteWrite.relabelConfig", "", "Optional path to file with relabeling configs, which are applied "+
+		"to all the metrics before sending them to -remoteWrite.url. See also -remoteWrite.urlRelabelConfig. "+
+		"The path can point either to local file or to http url. "+
+		"See https://docs.victoriametrics.com/vmagent.html#relabeling")
+	relabelConfigPaths = flagutil.NewArrayString("remoteWrite.urlRelabelConfig", "Optional path to relabel configs for the corresponding -remoteWrite.url. "+
+		"See also -remoteWrite.relabelConfig. The path can point either to local file or to http url. "+
+		"See https://docs.victoriametrics.com/vmagent.html#relabeling")
 
 	usePromCompatibleNaming = flag.Bool("usePromCompatibleNaming", false, "Whether to replace characters unsupported by Prometheus with underscores "+
 		"in the ingested metric names and label names. For example, foo.bar{a.b='c'} is transformed into foo_bar{a_b='c'} during data ingestion if this flag is set. "+
@@ -42,7 +39,7 @@ func CheckRelabelConfigs() error {
 func loadRelabelConfigs() (*relabelConfigs, error) {
 	var rcs relabelConfigs
 	if *relabelConfigPathGlobal != "" {
-		global, err := promrelabel.LoadRelabelConfigs(*relabelConfigPathGlobal, *relabelDebugGlobal)
+		global, err := promrelabel.LoadRelabelConfigs(*relabelConfigPathGlobal)
 		if err != nil {
 			return nil, fmt.Errorf("cannot load -remoteWrite.relabelConfig=%q: %w", *relabelConfigPathGlobal, err)
 		}
@@ -58,7 +55,7 @@ func loadRelabelConfigs() (*relabelConfigs, error) {
 			// Skip empty relabel config.
 			continue
 		}
-		prc, err := promrelabel.LoadRelabelConfigs(path, relabelDebug.GetOptionalArg(i))
+		prc, err := promrelabel.LoadRelabelConfigs(path)
 		if err != nil {
 			return nil, fmt.Errorf("cannot load relabel configs from -remoteWrite.urlRelabelConfig=%q: %w", path, err)
 		}
@@ -91,7 +88,7 @@ func initLabelsGlobal() {
 }
 
 func (rctx *relabelCtx) applyRelabeling(tss []prompbmarshal.TimeSeries, extraLabels []prompbmarshal.Label, pcs *promrelabel.ParsedConfigs) []prompbmarshal.TimeSeries {
-	if len(extraLabels) == 0 && pcs.Len() == 0 {
+	if len(extraLabels) == 0 && pcs.Len() == 0 && !*usePromCompatibleNaming {
 		// Nothing to change.
 		return tss
 	}

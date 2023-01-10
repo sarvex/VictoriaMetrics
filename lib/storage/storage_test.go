@@ -157,9 +157,12 @@ func TestUpdateCurrHourMetricIDs(t *testing.T) {
 	t.Run("empty_pending_metric_ids_stale_curr_hour", func(t *testing.T) {
 		s := newStorage()
 		hour := fasttime.UnixHour()
+		if hour%24 == 0 {
+			hour++
+		}
 		hmOrig := &hourMetricIDs{
 			m:    &uint64set.Set{},
-			hour: 123,
+			hour: hour - 1,
 		}
 		hmOrig.m.Add(12)
 		hmOrig.m.Add(34)
@@ -220,9 +223,12 @@ func TestUpdateCurrHourMetricIDs(t *testing.T) {
 		s.pendingHourEntries = pendingHourEntries
 
 		hour := fasttime.UnixHour()
+		if hour%24 == 0 {
+			hour++
+		}
 		hmOrig := &hourMetricIDs{
 			m:    &uint64set.Set{},
-			hour: 123,
+			hour: hour - 1,
 		}
 		hmOrig.m.Add(12)
 		hmOrig.m.Add(34)
@@ -254,6 +260,49 @@ func TestUpdateCurrHourMetricIDs(t *testing.T) {
 		s.pendingHourEntries = pendingHourEntries
 
 		hour := fasttime.UnixHour()
+		hmOrig := &hourMetricIDs{
+			m:    &uint64set.Set{},
+			hour: hour,
+		}
+		hmOrig.m.Add(12)
+		hmOrig.m.Add(34)
+		s.currHourMetricIDs.Store(hmOrig)
+		s.updateCurrHourMetricIDs(hour)
+		hmCurr := s.currHourMetricIDs.Load().(*hourMetricIDs)
+		if hmCurr.hour != hour {
+			t.Fatalf("unexpected hmCurr.hour; got %d; want %d", hmCurr.hour, hour)
+		}
+		m := pendingHourEntries.Clone()
+		hmOrig.m.ForEach(func(part []uint64) bool {
+			for _, metricID := range part {
+				m.Add(metricID)
+			}
+			return true
+		})
+		if !hmCurr.m.Equal(m) {
+			t.Fatalf("unexpected hm.m; got %v; want %v", hmCurr.m, m)
+		}
+
+		hmPrev := s.prevHourMetricIDs.Load().(*hourMetricIDs)
+		hmEmpty := &hourMetricIDs{}
+		if !reflect.DeepEqual(hmPrev, hmEmpty) {
+			t.Fatalf("unexpected hmPrev; got %v; want %v", hmPrev, hmEmpty)
+		}
+
+		if s.pendingHourEntries.Len() != 0 {
+			t.Fatalf("unexpected s.pendingHourEntries.Len(); got %d; want %d", s.pendingHourEntries.Len(), 0)
+		}
+	})
+	t.Run("nonempty_pending_metric_ids_valid_curr_hour_start_of_day", func(t *testing.T) {
+		s := newStorage()
+		pendingHourEntries := &uint64set.Set{}
+		pendingHourEntries.Add(343)
+		pendingHourEntries.Add(32424)
+		pendingHourEntries.Add(8293432)
+		s.pendingHourEntries = pendingHourEntries
+
+		hour := fasttime.UnixHour()
+		hour -= hour % 24
 		hmOrig := &hourMetricIDs{
 			m:    &uint64set.Set{},
 			hour: hour,
@@ -405,7 +454,7 @@ func TestStorageOpenMultipleTimes(t *testing.T) {
 
 func TestStorageRandTimestamps(t *testing.T) {
 	path := "TestStorageRandTimestamps"
-	retentionMsecs := int64(60 * msecsPerMonth)
+	retentionMsecs := int64(10 * msecsPerMonth)
 	s, err := OpenStorage(path, retentionMsecs, 0, 0)
 	if err != nil {
 		t.Fatalf("cannot open storage: %s", err)
@@ -413,10 +462,13 @@ func TestStorageRandTimestamps(t *testing.T) {
 	t.Run("serial", func(t *testing.T) {
 		for i := 0; i < 3; i++ {
 			if err := testStorageRandTimestamps(s); err != nil {
-				t.Fatal(err)
+				t.Fatalf("error on iteration %d: %s", i, err)
 			}
 			s.MustClose()
 			s, err = OpenStorage(path, retentionMsecs, 0, 0)
+			if err != nil {
+				t.Fatalf("cannot open storage on iteration %d: %s", i, err)
+			}
 		}
 	})
 	t.Run("concurrent", func(t *testing.T) {
@@ -430,14 +482,15 @@ func TestStorageRandTimestamps(t *testing.T) {
 				ch <- err
 			}()
 		}
+		tt := time.NewTimer(time.Second * 10)
 		for i := 0; i < cap(ch); i++ {
 			select {
 			case err := <-ch:
 				if err != nil {
-					t.Fatal(err)
+					t.Fatalf("error on iteration %d: %s", i, err)
 				}
-			case <-time.After(time.Second * 10):
-				t.Fatal("timeout")
+			case <-tt.C:
+				t.Fatalf("timeout on iteration %d", i)
 			}
 		}
 	})
@@ -448,9 +501,9 @@ func TestStorageRandTimestamps(t *testing.T) {
 }
 
 func testStorageRandTimestamps(s *Storage) error {
-	const rowsPerAdd = 1e3
-	const addsCount = 2
-	typ := reflect.TypeOf(int64(0))
+	currentTime := timestampFromTime(time.Now())
+	const rowsPerAdd = 5e3
+	const addsCount = 3
 	rnd := rand.New(rand.NewSource(1))
 
 	for i := 0; i < addsCount; i++ {
@@ -463,15 +516,8 @@ func testStorageRandTimestamps(s *Storage) error {
 		for j := 0; j < rowsPerAdd; j++ {
 			mn.MetricGroup = []byte(fmt.Sprintf("metric_%d", rand.Intn(100)))
 			metricNameRaw := mn.marshalRaw(nil)
-			timestamp := int64(rnd.NormFloat64() * 1e12)
-			if j%2 == 0 {
-				ts, ok := quick.Value(typ, rnd)
-				if !ok {
-					return fmt.Errorf("cannot create random timestamp via quick.Value")
-				}
-				timestamp = ts.Interface().(int64)
-			}
-			value := rnd.NormFloat64() * 1e12
+			timestamp := currentTime - int64((rnd.Float64()-0.2)*float64(2*s.retentionMsecs))
+			value := rnd.NormFloat64() * 1e11
 
 			mr := MetricRow{
 				MetricNameRaw: metricNameRaw,
@@ -491,8 +537,8 @@ func testStorageRandTimestamps(s *Storage) error {
 	// Verify the storage contains rows.
 	var m Metrics
 	s.UpdateMetrics(&m)
-	if m.TableMetrics.SmallRowsCount == 0 {
-		return fmt.Errorf("expecting at least one row in the table")
+	if rowsCount := m.TableMetrics.TotalRowsCount(); rowsCount == 0 {
+		return fmt.Errorf("expecting at least one row in storage")
 	}
 	return nil
 }
@@ -543,14 +589,15 @@ func TestStorageDeleteSeries(t *testing.T) {
 				ch <- err
 			}(i)
 		}
+		tt := time.NewTimer(30 * time.Second)
 		for i := 0; i < cap(ch); i++ {
 			select {
 			case err := <-ch:
 				if err != nil {
-					t.Fatalf("unexpected error: %s", err)
+					t.Fatalf("unexpected error on iteration %d: %s", i, err)
 				}
-			case <-time.After(30 * time.Second):
-				t.Fatalf("timeout")
+			case <-tt.C:
+				t.Fatalf("timeout on iteration %d", i)
 			}
 		}
 	})
@@ -860,9 +907,6 @@ func testStorageRegisterMetricNames(s *Storage) error {
 	if err != nil {
 		return fmt.Errorf("error in SearchMetricNames: %w", err)
 	}
-	if err != nil {
-		return fmt.Errorf("cannot unmarshal metric names: %w", err)
-	}
 	if len(metricNames) < metricsPerAdd {
 		return fmt.Errorf("unexpected number of metricNames returned from SearchMetricNames; got %d; want at least %d", len(metricNames), int(metricsPerAdd))
 	}
@@ -886,7 +930,8 @@ func testStorageRegisterMetricNames(s *Storage) error {
 
 func TestStorageAddRowsSerial(t *testing.T) {
 	path := "TestStorageAddRowsSerial"
-	s, err := OpenStorage(path, 0, 1e5, 1e5)
+	retentionMsecs := int64(msecsPerMonth * 10)
+	s, err := OpenStorage(path, retentionMsecs, 1e5, 1e5)
 	if err != nil {
 		t.Fatalf("cannot open storage: %s", err)
 	}
@@ -901,7 +946,8 @@ func TestStorageAddRowsSerial(t *testing.T) {
 
 func TestStorageAddRowsConcurrent(t *testing.T) {
 	path := "TestStorageAddRowsConcurrent"
-	s, err := OpenStorage(path, 0, 1e5, 1e5)
+	retentionMsecs := int64(msecsPerMonth * 10)
+	s, err := OpenStorage(path, retentionMsecs, 1e5, 1e5)
 	if err != nil {
 		t.Fatalf("cannot open storage: %s", err)
 	}
@@ -954,8 +1000,10 @@ func testStorageAddRows(s *Storage) error {
 	const rowsPerAdd = 1e3
 	const addsCount = 10
 
+	maxTimestamp := timestampFromTime(time.Now())
+	minTimestamp := maxTimestamp - s.retentionMsecs
 	for i := 0; i < addsCount; i++ {
-		mrs := testGenerateMetricRows(rowsPerAdd, 0, 1e10)
+		mrs := testGenerateMetricRows(rowsPerAdd, minTimestamp, maxTimestamp)
 		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
 			return fmt.Errorf("unexpected error when adding mrs: %w", err)
 		}
@@ -965,8 +1013,8 @@ func testStorageAddRows(s *Storage) error {
 	minRowsExpected := uint64(rowsPerAdd * addsCount)
 	var m Metrics
 	s.UpdateMetrics(&m)
-	if m.TableMetrics.SmallRowsCount < minRowsExpected {
-		return fmt.Errorf("expecting at least %d rows in the table; got %d", minRowsExpected, m.TableMetrics.SmallRowsCount)
+	if rowsCount := m.TableMetrics.TotalRowsCount(); rowsCount < minRowsExpected {
+		return fmt.Errorf("expecting at least %d rows in the table; got %d", minRowsExpected, rowsCount)
 	}
 
 	// Try creating a snapshot from the storage.
@@ -994,8 +1042,8 @@ func testStorageAddRows(s *Storage) error {
 	// Verify the snapshot contains rows
 	var m1 Metrics
 	s1.UpdateMetrics(&m1)
-	if m1.TableMetrics.SmallRowsCount < minRowsExpected {
-		return fmt.Errorf("snapshot %q must contain at least %d rows; got %d", snapshotPath, minRowsExpected, m1.TableMetrics.SmallRowsCount)
+	if rowsCount := m1.TableMetrics.TotalRowsCount(); rowsCount < minRowsExpected {
+		return fmt.Errorf("snapshot %q must contain at least %d rows; got %d", snapshotPath, minRowsExpected, rowsCount)
 	}
 
 	// Verify that force merge for the snapshot leaves only a single part per partition.
@@ -1109,22 +1157,25 @@ func testStorageAddMetrics(s *Storage, workerNum int) error {
 	minRowsExpected := uint64(rowsCount)
 	var m Metrics
 	s.UpdateMetrics(&m)
-	if m.TableMetrics.SmallRowsCount < minRowsExpected {
-		return fmt.Errorf("expecting at least %d rows in the table; got %d", minRowsExpected, m.TableMetrics.SmallRowsCount)
+	if rowsCount := m.TableMetrics.TotalRowsCount(); rowsCount < minRowsExpected {
+		return fmt.Errorf("expecting at least %d rows in the table; got %d", minRowsExpected, rowsCount)
 	}
 	return nil
 }
 
 func TestStorageDeleteStaleSnapshots(t *testing.T) {
 	path := "TestStorageDeleteStaleSnapshots"
-	s, err := OpenStorage(path, 0, 1e5, 1e5)
+	retentionMsecs := int64(msecsPerMonth * 10)
+	s, err := OpenStorage(path, retentionMsecs, 1e5, 1e5)
 	if err != nil {
 		t.Fatalf("cannot open storage: %s", err)
 	}
 	const rowsPerAdd = 1e3
 	const addsCount = 10
+	maxTimestamp := timestampFromTime(time.Now())
+	minTimestamp := maxTimestamp - s.retentionMsecs
 	for i := 0; i < addsCount; i++ {
-		mrs := testGenerateMetricRows(rowsPerAdd, 0, 1e10)
+		mrs := testGenerateMetricRows(rowsPerAdd, minTimestamp, maxTimestamp)
 		if err := s.AddRows(mrs, defaultPrecisionBits); err != nil {
 			t.Fatalf("unexpected error when adding mrs: %s", err)
 		}

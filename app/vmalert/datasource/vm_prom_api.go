@@ -32,19 +32,17 @@ type promInstant struct {
 }
 
 func (r promInstant) metrics() ([]Metric, error) {
-	var result []Metric
+	result := make([]Metric, len(r.Result))
 	for i, res := range r.Result {
 		f, err := strconv.ParseFloat(res.TV[1].(string), 64)
 		if err != nil {
 			return nil, fmt.Errorf("metric %v, unable to parse float64 from %s: %w", res, res.TV[1], err)
 		}
 		var m Metric
-		for k, v := range r.Result[i].Labels {
-			m.AddLabel(k, v)
-		}
+		m.SetLabels(res.Labels)
 		m.Timestamps = append(m.Timestamps, int64(res.TV[0].(float64)))
 		m.Values = append(m.Values, f)
-		result = append(result, m)
+		result[i] = m
 	}
 	return result, nil
 }
@@ -149,6 +147,16 @@ func (s *VMStorage) setPrometheusInstantReqParams(r *http.Request, query string,
 		timestamp = timestamp.Truncate(s.evaluationInterval)
 	}
 	q.Set("time", fmt.Sprintf("%d", timestamp.Unix()))
+	if s.evaluationInterval > 0 { // set step as evaluationInterval by default
+		// always convert to seconds to keep compatibility with older
+		// Prometheus versions. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1943
+		q.Set("step", fmt.Sprintf("%ds", int(s.evaluationInterval.Seconds())))
+	}
+	if s.queryStep > 0 { // override step with user-specified value
+		// always convert to seconds to keep compatibility with older
+		// Prometheus versions. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1943
+		q.Set("step", fmt.Sprintf("%ds", int(s.queryStep.Seconds())))
+	}
 	r.URL.RawQuery = q.Encode()
 	s.setPrometheusReqParams(r, query)
 }
@@ -163,6 +171,11 @@ func (s *VMStorage) setPrometheusRangeReqParams(r *http.Request, query string, s
 	q := r.URL.Query()
 	q.Add("start", fmt.Sprintf("%d", start.Unix()))
 	q.Add("end", fmt.Sprintf("%d", end.Unix()))
+	if s.evaluationInterval > 0 { // set step as evaluationInterval by default
+		// always convert to seconds to keep compatibility with older
+		// Prometheus versions. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1943
+		q.Set("step", fmt.Sprintf("%ds", int(s.evaluationInterval.Seconds())))
+	}
 	r.URL.RawQuery = q.Encode()
 	s.setPrometheusReqParams(r, query)
 }
@@ -178,15 +191,5 @@ func (s *VMStorage) setPrometheusReqParams(r *http.Request, query string) {
 		}
 	}
 	q.Set("query", query)
-	if s.evaluationInterval > 0 { // set step as evaluationInterval by default
-		// always convert to seconds to keep compatibility with older
-		// Prometheus versions. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1943
-		q.Set("step", fmt.Sprintf("%ds", int(s.evaluationInterval.Seconds())))
-	}
-	if s.queryStep > 0 { // override step with user-specified value
-		// always convert to seconds to keep compatibility with older
-		// Prometheus versions. See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1943
-		q.Set("step", fmt.Sprintf("%ds", int(s.queryStep.Seconds())))
-	}
 	r.URL.RawQuery = q.Encode()
 }

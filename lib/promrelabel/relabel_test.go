@@ -2,9 +2,11 @@ package promrelabel
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 func TestSanitizeName(t *testing.T) {
@@ -26,7 +28,7 @@ func TestSanitizeName(t *testing.T) {
 func TestLabelsToString(t *testing.T) {
 	f := func(labels []prompbmarshal.Label, sExpected string) {
 		t.Helper()
-		s := labelsToString(labels)
+		s := LabelsToString(labels)
 		if s != sExpected {
 			t.Fatalf("unexpected result;\ngot\n%s\nwant\n%s", s, sExpected)
 		}
@@ -70,20 +72,95 @@ func TestLabelsToString(t *testing.T) {
 	}, `xxx{a="bc",foo="bar"}`)
 }
 
-func TestApplyRelabelConfigs(t *testing.T) {
-	f := func(config, metric string, isFinalize bool, resultExpected string) {
+func TestParsedRelabelConfigsApplyDebug(t *testing.T) {
+	f := func(config, metric string, dssExpected []DebugStep) {
 		t.Helper()
-		pcs, err := ParseRelabelConfigsData([]byte(config), false)
+		pcs, err := ParseRelabelConfigsData([]byte(config))
 		if err != nil {
 			t.Fatalf("cannot parse %q: %s", config, err)
 		}
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := pcs.Apply(labels, 0)
+		labels := promutils.MustNewLabelsFromString(metric)
+		_, dss := pcs.ApplyDebug(labels.GetLabels())
+		if !reflect.DeepEqual(dss, dssExpected) {
+			t.Fatalf("unexpected result; got\n%s\nwant\n%s", dss, dssExpected)
+		}
+	}
+
+	// empty relabel config
+	f(``, `foo`, nil)
+	// add label
+	f(`
+- target_label: abc
+  replacement: xyz
+`, `foo{bar="baz"}`, []DebugStep{
+		{
+			Rule: "target_label: abc\nreplacement: xyz\n",
+			In:   `foo{bar="baz"}`,
+			Out:  `foo{abc="xyz",bar="baz"}`,
+		},
+	})
+	// drop label
+	f(`
+- target_label: bar
+  replacement: ''
+`, `foo{bar="baz"}`, []DebugStep{
+		{
+			Rule: "target_label: bar\nreplacement: \"\"\n",
+			In:   `foo{bar="baz"}`,
+			Out:  `foo{bar=""}`,
+		},
+		{
+			Rule: "remove empty labels",
+			In:   `foo{bar=""}`,
+			Out:  `foo`,
+		},
+	})
+	// drop metric
+	f(`
+- action: drop
+  source_labels: [bar]
+  regex: baz
+`, `foo{bar="baz",abc="def"}`, []DebugStep{
+		{
+			Rule: "action: drop\nsource_labels: [bar]\nregex: baz\n",
+			In:   `foo{abc="def",bar="baz"}`,
+			Out:  `{}`,
+		},
+	})
+	// Multiple steps
+	f(`
+- action: labeldrop
+  regex: "foo.*"
+- target_label: foobar
+  replacement: "abc"
+`, `m{foo="x",foobc="123",a="b"}`, []DebugStep{
+		{
+			Rule: "action: labeldrop\nregex: foo.*\n",
+			In:   `m{a="b",foo="x",foobc="123"}`,
+			Out:  `m{a="b"}`,
+		},
+		{
+			Rule: "target_label: foobar\nreplacement: abc\n",
+			In:   `m{a="b"}`,
+			Out:  `m{a="b",foobar="abc"}`,
+		},
+	})
+}
+
+func TestParsedRelabelConfigsApply(t *testing.T) {
+	f := func(config, metric string, isFinalize bool, resultExpected string) {
+		t.Helper()
+		pcs, err := ParseRelabelConfigsData([]byte(config))
+		if err != nil {
+			t.Fatalf("cannot parse %q: %s", config, err)
+		}
+		labels := promutils.MustNewLabelsFromString(metric)
+		resultLabels := pcs.Apply(labels.GetLabels(), 0)
 		if isFinalize {
 			resultLabels = FinalizeLabels(resultLabels[:0], resultLabels)
 		}
 		SortLabels(resultLabels)
-		result := labelsToString(resultLabels)
+		result := LabelsToString(resultLabels)
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
 		}
@@ -322,6 +399,34 @@ func TestApplyRelabelConfigs(t *testing.T) {
 - action: drop_if_equal
   source_labels: [xxx, bar]
 `, `{xxx="yyy",bar="yyy"}`, true, `{}`)
+	})
+	t.Run("keepequal-hit", func(t *testing.T) {
+		f(`
+- action: keepequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="a"}`, true, `{bar="a",foo="a"}`)
+	})
+	t.Run("keepequal-miss", func(t *testing.T) {
+		f(`
+- action: keepequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="x"}`, true, `{}`)
+	})
+	t.Run("dropequal-hit", func(t *testing.T) {
+		f(`
+- action: dropequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="a"}`, true, `{}`)
+	})
+	t.Run("dropequal-miss", func(t *testing.T) {
+		f(`
+- action: dropequal
+  source_labels: [foo]
+  target_label: bar
+`, `{foo="a",bar="x"}`, true, `{bar="x",foo="a"}`)
 	})
 	t.Run("keep-miss", func(t *testing.T) {
 		f(`
@@ -725,9 +830,9 @@ func TestApplyRelabelConfigs(t *testing.T) {
 func TestFinalizeLabels(t *testing.T) {
 	f := func(metric, resultExpected string) {
 		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := FinalizeLabels(nil, labels)
-		result := labelsToString(resultLabels)
+		labels := promutils.MustNewLabelsFromString(metric)
+		resultLabels := FinalizeLabels(nil, labels.GetLabels())
+		result := LabelsToString(resultLabels)
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
 		}
@@ -738,27 +843,11 @@ func TestFinalizeLabels(t *testing.T) {
 	f(`{foo="bar",abc="def",__address__="foo.com"}`, `{abc="def",foo="bar"}`)
 }
 
-func TestRemoveMetaLabels(t *testing.T) {
-	f := func(metric, resultExpected string) {
-		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		resultLabels := RemoveMetaLabels(nil, labels)
-		result := labelsToString(resultLabels)
-		if result != resultExpected {
-			t.Fatalf("unexpected result of RemoveMetaLabels;\ngot\n%s\nwant\n%s", result, resultExpected)
-		}
-	}
-	f(`{}`, `{}`)
-	f(`{foo="bar"}`, `{foo="bar"}`)
-	f(`{__meta_foo="bar"}`, `{}`)
-	f(`{__meta_foo="bdffr",foo="bar",__meta_xxx="basd"}`, `{foo="bar"}`)
-}
-
 func TestFillLabelReferences(t *testing.T) {
 	f := func(replacement, metric, resultExpected string) {
 		t.Helper()
-		labels := MustParseMetricWithLabels(metric)
-		result := fillLabelReferences(nil, replacement, labels)
+		labels := promutils.MustNewLabelsFromString(metric)
+		result := fillLabelReferences(nil, replacement, labels.GetLabels())
 		if string(result) != resultExpected {
 			t.Fatalf("unexpected result; got\n%q\nwant\n%q", result, resultExpected)
 		}

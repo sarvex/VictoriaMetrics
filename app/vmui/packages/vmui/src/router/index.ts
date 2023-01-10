@@ -1,16 +1,20 @@
 const router = {
   home: "/",
+  metrics: "/metrics",
   dashboards: "/dashboards",
   cardinality: "/cardinality",
   topQueries: "/top-queries",
+  trace: "/trace",
+  icons: "/icons"
 };
 
 export interface RouterOptions {
+  title?: string,
   header: {
     timeSelector?: boolean,
     executionControls?: boolean,
     globalSettings?: boolean,
-    datePicker?: boolean
+    cardinalityDatePicker?: boolean
   }
 }
 
@@ -18,18 +22,41 @@ const routerOptionsDefault = {
   header: {
     timeSelector: true,
     executionControls: true,
-    globalSettings: true,
   }
 };
 
 export const routerOptions: {[key: string]: RouterOptions} = {
-  [router.home]: routerOptionsDefault,
-  [router.dashboards]: routerOptionsDefault,
-  [router.cardinality]: {
+  [router.home]: {
+    title: "Query",
+    ...routerOptionsDefault
+  },
+  [router.metrics]: {
+    title: "Explore metrics",
     header: {
-      datePicker: true,
-      globalSettings: true,
+      timeSelector: true,
     }
+  },
+  [router.cardinality]: {
+    title: "Explore cardinality",
+    header: {
+      cardinalityDatePicker: true,
+    }
+  },
+  [router.topQueries]: {
+    title: "Top queries",
+    header: {}
+  },
+  [router.trace]: {
+    title: "Trace analyzer",
+    header: {}
+  },
+  [router.dashboards]: {
+    title: "Dashboards",
+    ...routerOptionsDefault,
+  },
+  [router.icons]: {
+    title: "Icons",
+    header: {}
   }
 };
 

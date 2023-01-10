@@ -74,8 +74,13 @@ func newAlertingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rule
 			Debug:              cfg.Debug,
 		}),
 		alerts:  make(map[uint64]*notifier.Alert),
-		state:   newRuleState(),
 		metrics: &alertingRuleMetrics{},
+	}
+
+	if cfg.UpdateEntriesLimit != nil {
+		ar.state = newRuleState(*cfg.UpdateEntriesLimit)
+	} else {
+		ar.state = newRuleState(*ruleUpdateEntriesLimit)
 	}
 
 	labels := fmt.Sprintf(`alertname=%q, group=%q, id="%d"`, ar.Name, group.Name, ar.ID())
@@ -284,7 +289,7 @@ func (ar *AlertingRule) Exec(ctx context.Context, ts time.Time, limit int) ([]pr
 		duration: time.Since(start),
 		samples:  len(qMetrics),
 		err:      err,
-		req:      req,
+		curl:     requestToCurl(req),
 	}
 
 	defer func() {
@@ -456,6 +461,7 @@ func (ar *AlertingRule) newAlert(m datasource.Metric, ls *labelSet, start time.T
 		Value:    m.Values[0],
 		ActiveAt: start,
 		Expr:     ar.Expr,
+		For:      ar.For,
 	}
 	a.Annotations, err = a.ExecTemplate(qFn, ls.origin, ar.Annotations)
 	return a, err
@@ -490,6 +496,7 @@ func (ar *AlertingRule) ToAPI() APIRule {
 		State:          "inactive",
 		Alerts:         ar.AlertsToAPI(),
 		LastSamples:    lastState.samples,
+		MaxUpdates:     ar.state.size(),
 		Updates:        ar.state.getAll(),
 
 		// encode as strings to avoid rounding in JSON

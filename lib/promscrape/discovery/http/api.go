@@ -3,11 +3,12 @@ package http
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
-	"github.com/VictoriaMetrics/fasthttp"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -25,7 +26,7 @@ type apiConfig struct {
 // https://prometheus.io/docs/prometheus/latest/http_sd/
 type httpGroupTarget struct {
 	Targets []string          `json:"targets"`
-	Labels  map[string]string `json:"labels"`
+	Labels  *promutils.Labels `json:"labels"`
 }
 
 func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
@@ -65,7 +66,7 @@ func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 }
 
 func getHTTPTargets(cfg *apiConfig) ([]httpGroupTarget, error) {
-	data, err := cfg.client.GetAPIResponseWithReqParams(cfg.path, func(request *fasthttp.Request) {
+	data, err := cfg.client.GetAPIResponseWithReqParams(cfg.path, func(request *http.Request) {
 		request.Header.Set("X-Prometheus-Refresh-Interval-Seconds", strconv.FormatFloat(SDCheckInterval.Seconds(), 'f', 0, 64))
 		request.Header.Set("Accept", "application/json")
 	})

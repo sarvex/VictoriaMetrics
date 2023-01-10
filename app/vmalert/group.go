@@ -168,9 +168,12 @@ func (g *Group) Restore(ctx context.Context, qb datasource.QuerierBuilder, lookb
 		if rr.For < 1 {
 			continue
 		}
-		// ignore g.ExtraFilterLabels on purpose, so it
-		// won't affect the restore procedure.
-		q := qb.BuildWithParams(datasource.QuerierParams{})
+		// ignore QueryParams on purpose, because they could contain
+		// query filters. This may affect the restore procedure.
+		q := qb.BuildWithParams(datasource.QuerierParams{
+			DataSourceType: g.Type.String(),
+			Headers:        g.Headers,
+		})
 		if err := rr.Restore(ctx, q, lookback, labels); err != nil {
 			return fmt.Errorf("error while restoring rule %q: %w", rule, err)
 		}
@@ -418,20 +421,26 @@ func (e *executor) exec(ctx context.Context, rule Rule, ts time.Time, resolveDur
 		return fmt.Errorf("rule %q: failed to execute: %w", rule, err)
 	}
 
-	errGr := new(utils.ErrGroup)
 	if e.rw != nil {
-		pushToRW := func(tss []prompbmarshal.TimeSeries) {
+		pushToRW := func(tss []prompbmarshal.TimeSeries) error {
+			var lastErr error
 			for _, ts := range tss {
 				remoteWriteTotal.Inc()
 				if err := e.rw.Push(ts); err != nil {
 					remoteWriteErrors.Inc()
-					errGr.Add(fmt.Errorf("rule %q: remote write failure: %w", rule, err))
+					lastErr = fmt.Errorf("rule %q: remote write failure: %w", rule, err)
 				}
 			}
+			return lastErr
 		}
-		pushToRW(tss)
+		if err := pushToRW(tss); err != nil {
+			return err
+		}
+
 		staleSeries := e.getStaleSeries(rule, tss, ts)
-		pushToRW(staleSeries)
+		if err := pushToRW(staleSeries); err != nil {
+			return err
+		}
 	}
 
 	ar, ok := rule.(*AlertingRule)
@@ -445,6 +454,7 @@ func (e *executor) exec(ctx context.Context, rule Rule, ts time.Time, resolveDur
 	}
 
 	wg := sync.WaitGroup{}
+	errGr := new(utils.ErrGroup)
 	for _, nt := range e.notifiers() {
 		wg.Add(1)
 		go func(nt notifier.Notifier) {

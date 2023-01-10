@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
@@ -115,16 +116,17 @@ func aggrFuncExt(afe func(tss []*timeseries, modifier *metricsql.ModifierExpr) [
 	for i, ts := range arg {
 		removeGroupTags(&ts.MetricName, modifier)
 		bb.B = marshalMetricNameSorted(bb.B[:0], &ts.MetricName)
+		k := bytesutil.InternBytes(bb.B)
 		if keepOriginal {
 			ts = argOrig[i]
 		}
-		tss := m[string(bb.B)]
+		tss := m[k]
 		if tss == nil && maxSeries > 0 && len(m) >= maxSeries {
 			// We already reached time series limit after grouping. Skip other time series.
 			continue
 		}
 		tss = append(tss, ts)
-		m[string(bb.B)] = tss
+		m[k] = tss
 	}
 	bbPool.Put(bb)
 
@@ -748,7 +750,7 @@ func getIntK(k float64, kMax int) int {
 	if math.IsNaN(k) {
 		return 0
 	}
-	kn := int(k)
+	kn := floatToIntBounded(k)
 	if kn < 0 {
 		return 0
 	}
@@ -817,7 +819,7 @@ func lastValue(values []float64) float64 {
 // quantiles calculates the given phis from originValues without modifying originValues, appends them to qs and returns the result.
 func quantiles(qs, phis []float64, originValues []float64) []float64 {
 	a := getFloat64s()
-	a.A = prepareForQuantileFloat64(a.A[:0], originValues)
+	a.prepareForQuantileFloat64(originValues)
 	qs = quantilesSorted(qs, phis, a.A)
 	putFloat64s(a)
 	return qs
@@ -826,22 +828,38 @@ func quantiles(qs, phis []float64, originValues []float64) []float64 {
 // quantile calculates the given phi from originValues without modifying originValues
 func quantile(phi float64, originValues []float64) float64 {
 	a := getFloat64s()
-	a.A = prepareForQuantileFloat64(a.A[:0], originValues)
+	a.prepareForQuantileFloat64(originValues)
 	q := quantileSorted(phi, a.A)
 	putFloat64s(a)
 	return q
 }
 
-// prepareForQuantileFloat64 copies items from src to dst but removes NaNs and sorts the dst
-func prepareForQuantileFloat64(dst, src []float64) []float64 {
+// prepareForQuantileFloat64 copies items from src to a but removes NaNs and sorts items in a.
+func (a *float64s) prepareForQuantileFloat64(src []float64) {
+	dst := a.A[:0]
 	for _, v := range src {
 		if math.IsNaN(v) {
 			continue
 		}
 		dst = append(dst, v)
 	}
-	sort.Float64s(dst)
-	return dst
+	a.A = dst
+	// Use sort.Sort instead of sort.Float64s in order to avoid a memory allocation
+	sort.Sort(a)
+}
+
+func (a *float64s) Len() int {
+	return len(a.A)
+}
+
+func (a *float64s) Swap(i, j int) {
+	x := a.A
+	x[i], x[j] = x[j], x[i]
+}
+
+func (a *float64s) Less(i, j int) bool {
+	x := a.A
+	return x[i] < x[j]
 }
 
 // quantilesSorted calculates the given phis over a sorted list of values, appends them to qs and returns the result.
@@ -999,13 +1017,9 @@ func aggrFuncLimitK(afa *aggrFuncArg) ([]*timeseries, error) {
 	if err := expectTransformArgsNum(args, 2); err != nil {
 		return nil, err
 	}
-	limits, err := getScalar(args[0], 0)
+	limit, err := getIntNumber(args[0], 0)
 	if err != nil {
 		return nil, fmt.Errorf("cannot obtain limit arg: %w", err)
-	}
-	limit := 0
-	if len(limits) > 0 {
-		limit = int(limits[0])
 	}
 	if limit < 0 {
 		limit = 0
@@ -1154,4 +1168,14 @@ func lessWithNaNs(a, b float64) bool {
 		return !math.IsNaN(b)
 	}
 	return a < b
+}
+
+func floatToIntBounded(f float64) int {
+	if f > math.MaxInt {
+		return math.MaxInt
+	}
+	if f < math.MinInt {
+		return math.MinInt
+	}
+	return int(f)
 }

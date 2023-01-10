@@ -145,11 +145,11 @@ var rollupAggrFuncs = map[string]rollupFunc{
 	"zscore_over_time":        rollupZScoreOverTime,
 }
 
-// VictoriaMetrics can increase lookbehind window in square brackets for these functions
-// if the given window doesn't contain enough samples for calculations.
+// VictoriaMetrics can extends lookbehind window for these functions
+// in order to make sure it contains enough points for returning non-empty results.
 //
-// This is needed in order to return the expected non-empty graphs when zooming in the graph in Grafana,
-// which is built with `func_name(metric[$__interval])` query.
+// This is needed for returning the expected non-empty graphs when zooming in the graph in Grafana,
+// which is built with `func_name(metric)` query.
 var rollupFuncsCanAdjustWindow = map[string]bool{
 	"default_rollup":         true,
 	"deriv":                  true,
@@ -584,14 +584,22 @@ func (rc *rollupConfig) doInternal(dstValues []float64, tsm *timeseriesMap, valu
 	window := rc.Window
 	if window <= 0 {
 		window = rc.Step
+		if rc.MayAdjustWindow && window < maxPrevInterval {
+			// Adjust lookbehind window only if it isn't set explicilty, e.g. rate(foo).
+			// In the case of missing lookbehind window it should be adjusted in order to return non-empty graph
+			// when the window doesn't cover at least two raw samples (this is what most users expect).
+			//
+			// If the user explicitly sets the lookbehind window to some fixed value, e.g. rate(foo[1s]),
+			// then it is expected he knows what he is doing. Do not adjust the lookbehind window then.
+			//
+			// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3483
+			window = maxPrevInterval
+		}
 		if rc.isDefaultRollup && rc.LookbackDelta > 0 && window > rc.LookbackDelta {
 			// Implicit window exceeds -search.maxStalenessInterval, so limit it to -search.maxStalenessInterval
 			// according to https://github.com/VictoriaMetrics/VictoriaMetrics/issues/784
 			window = rc.LookbackDelta
 		}
-	}
-	if rc.MayAdjustWindow && window < maxPrevInterval {
-		window = maxPrevInterval
 	}
 	rfa := getRollupFuncArg()
 	rfa.idx = 0
@@ -894,7 +902,7 @@ func newRollupPredictLinear(args []interface{}) (rollupFunc, error) {
 		return nil, err
 	}
 	rf := func(rfa *rollupFuncArg) float64 {
-		v, k := linearRegression(rfa)
+		v, k := linearRegression(rfa.values, rfa.timestamps, rfa.currTimestamp)
 		if math.IsNaN(v) {
 			return nan
 		}
@@ -904,13 +912,8 @@ func newRollupPredictLinear(args []interface{}) (rollupFunc, error) {
 	return rf, nil
 }
 
-func linearRegression(rfa *rollupFuncArg) (float64, float64) {
-	// There is no need in handling NaNs here, since they must be cleaned up
-	// before calling rollup funcs.
-	values := rfa.values
-	timestamps := rfa.timestamps
-	n := float64(len(values))
-	if n == 0 {
+func linearRegression(values []float64, timestamps []int64, interceptTime int64) (float64, float64) {
+	if len(values) == 0 {
 		return nan, nan
 	}
 	if areConstValues(values) {
@@ -918,25 +921,32 @@ func linearRegression(rfa *rollupFuncArg) (float64, float64) {
 	}
 
 	// See https://en.wikipedia.org/wiki/Simple_linear_regression#Numerical_example
-	interceptTime := rfa.currTimestamp
 	vSum := float64(0)
 	tSum := float64(0)
 	tvSum := float64(0)
 	ttSum := float64(0)
+	n := 0
 	for i, v := range values {
+		if math.IsNaN(v) {
+			continue
+		}
 		dt := float64(timestamps[i]-interceptTime) / 1e3
 		vSum += v
 		tSum += dt
 		tvSum += dt * v
 		ttSum += dt * dt
+		n++
+	}
+	if n == 0 {
+		return nan, nan
 	}
 	k := float64(0)
-	tDiff := ttSum - tSum*tSum/n
+	tDiff := ttSum - tSum*tSum/float64(n)
 	if math.Abs(tDiff) >= 1e-6 {
 		// Prevent from incorrect division for too small tDiff values.
-		k = (tvSum - tSum*vSum/n) / tDiff
+		k = (tvSum - tSum*vSum/float64(n)) / tDiff
 	}
-	v := vSum/n - k*tSum/n
+	v := vSum/float64(n) - k*tSum/float64(n)
 	return v, k
 }
 
@@ -1473,16 +1483,20 @@ func rollupStaleSamples(rfa *rollupFuncArg) float64 {
 }
 
 func rollupStddev(rfa *rollupFuncArg) float64 {
-	stdvar := rollupStdvar(rfa)
-	return math.Sqrt(stdvar)
+	return stddev(rfa.values)
 }
 
 func rollupStdvar(rfa *rollupFuncArg) float64 {
-	// See `Rapid calculation methods` at https://en.wikipedia.org/wiki/Standard_deviation
+	return stdvar(rfa.values)
+}
 
-	// There is no need in handling NaNs here, since they must be cleaned up
-	// before calling rollup funcs.
-	values := rfa.values
+func stddev(values []float64) float64 {
+	v := stdvar(values)
+	return math.Sqrt(v)
+}
+
+func stdvar(values []float64) float64 {
+	// See `Rapid calculation methods` at https://en.wikipedia.org/wiki/Standard_deviation
 	if len(values) == 0 {
 		return nan
 	}
@@ -1494,10 +1508,16 @@ func rollupStdvar(rfa *rollupFuncArg) float64 {
 	var count float64
 	var q float64
 	for _, v := range values {
+		if math.IsNaN(v) {
+			continue
+		}
 		count++
 		avgNew := avg + (v-avg)/count
 		q += (v - avg) * (v - avgNew)
 		avg = avgNew
+	}
+	if count == 0 {
+		return nan
 	}
 	return q / count
 }
@@ -1605,7 +1625,7 @@ func rollupIdelta(rfa *rollupFuncArg) float64 {
 func rollupDerivSlow(rfa *rollupFuncArg) float64 {
 	// Use linear regression like Prometheus does.
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/73
-	_, k := linearRegression(rfa)
+	_, k := linearRegression(rfa.values, rfa.timestamps, rfa.currTimestamp)
 	return k
 }
 
@@ -2115,7 +2135,7 @@ func getIntNumber(arg interface{}, argNum int) (int, error) {
 	}
 	n := 0
 	if len(v) > 0 {
-		n = int(v[0])
+		n = floatToIntBounded(v[0])
 	}
 	return n, nil
 }

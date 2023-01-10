@@ -1,0 +1,24 @@
+@use "src/styles/variables" as *;
+
+.vm-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: $padding-medium;
+  gap: $padding-large;
+  border-top: $border-divider;
+  color: $color-text-secondary;
+
+  &__website {
+    display: grid;
+    grid-template-columns: 12px auto;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+
+  &__copyright {
+    text-align: right;
+    flex-grow: 1;
+  }
+}

@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
@@ -24,8 +25,10 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/gce"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/http"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kubernetes"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/nomad"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/openstack"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/yandexcloud"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -112,6 +115,9 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 	configData.Store(&marshaledData)
 	cfg.mustStart()
 
+	configSuccess.Set(1)
+	configTimestamp.Set(fasttime.UnixTimestamp())
+
 	scs := newScrapeConfigs(pushData, globalStopCh)
 	scs.add("azure_sd_configs", *azure.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getAzureSDScrapeWork(swsPrev) })
 	scs.add("consul_sd_configs", *consul.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getConsulSDScrapeWork(swsPrev) })
@@ -125,6 +131,7 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 	scs.add("gce_sd_configs", *gce.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getGCESDScrapeWork(swsPrev) })
 	scs.add("http_sd_configs", *http.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getHTTPDScrapeWork(swsPrev) })
 	scs.add("kubernetes_sd_configs", *kubernetes.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
+	scs.add("nomad_sd_configs", *nomad.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getNomadSDScrapeWork(swsPrev) })
 	scs.add("openstack_sd_configs", *openstack.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getOpenStackSDScrapeWork(swsPrev) })
 	scs.add("yandexcloud_sd_configs", *yandexcloud.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getYandexCloudSDScrapeWork(swsPrev) })
 	scs.add("static_configs", 0, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getStaticScrapeWork() })
@@ -143,6 +150,8 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 			logger.Infof("SIGHUP received; reloading Prometheus configs from %q", configFile)
 			cfgNew, dataNew, err := loadConfig(configFile)
 			if err != nil {
+				configReloadErrors.Inc()
+				configSuccess.Set(0)
 				logger.Errorf("cannot read %q on SIGHUP: %s; continuing with the previous config", configFile, err)
 				goto waitForChans
 			}
@@ -158,6 +167,8 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 		case <-tickerCh:
 			cfgNew, dataNew, err := loadConfig(configFile)
 			if err != nil {
+				configReloadErrors.Inc()
+				configSuccess.Set(0)
 				logger.Errorf("cannot read %q: %s; continuing with the previous config", configFile, err)
 				goto waitForChans
 			}
@@ -180,10 +191,17 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 		}
 		logger.Infof("found changes in %q; applying these changes", configFile)
 		configReloads.Inc()
+		configSuccess.Set(1)
+		configTimestamp.Set(fasttime.UnixTimestamp())
 	}
 }
 
-var configReloads = metrics.NewCounter(`vm_promscrape_config_reloads_total`)
+var (
+	configReloads      = metrics.NewCounter(`vm_promscrape_config_reloads_total`)
+	configReloadErrors = metrics.NewCounter(`vm_promscrape_config_reloads_errors_total`)
+	configSuccess      = metrics.NewCounter(`vm_promscrape_config_last_reload_successful`)
+	configTimestamp    = metrics.NewCounter(`vm_promscrape_config_last_reload_success_timestamp_seconds`)
+)
 
 type scrapeConfigs struct {
 	pushData     func(at *auth.Token, wr *prompbmarshal.WriteRequest)
@@ -336,7 +354,7 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 
 	additionsCount := 0
 	deletionsCount := 0
-	swsMap := make(map[string][]prompbmarshal.Label, len(sws))
+	swsMap := make(map[string]*promutils.Labels, len(sws))
 	var swsToStart []*ScrapeWork
 	for _, sw := range sws {
 		key := sw.key()
@@ -347,9 +365,9 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 					"make sure service discovery and relabeling is set up properly; "+
 					"see also https://docs.victoriametrics.com/vmagent.html#troubleshooting; "+
 					"original labels for target1: %s; original labels for target2: %s",
-					sw.ScrapeURL, sw.LabelsString(), promLabelsString(originalLabels), promLabelsString(sw.OriginalLabels))
+					sw.ScrapeURL, sw.Labels.String(), originalLabels.String(), sw.OriginalLabels.String())
 			}
-			droppedTargetsMap.Register(sw.OriginalLabels)
+			droppedTargetsMap.Register(sw.OriginalLabels, sw.RelabelConfigs)
 			continue
 		}
 		swsMap[key] = sw.OriginalLabels

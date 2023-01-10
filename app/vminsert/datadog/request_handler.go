@@ -1,7 +1,6 @@
 package datadog
 
 import (
-	"fmt"
 	"net/http"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert/common"
@@ -9,7 +8,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/datadog"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
 )
 
@@ -26,15 +24,9 @@ func InsertHandlerForHTTP(req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return writeconcurrencylimiter.Do(func() error {
-		ce := req.Header.Get("Content-Encoding")
-		err := parser.ParseStream(req.Body, ce, func(series []parser.Series) error {
-			return insertRows(series, extraLabels)
-		})
-		if err != nil {
-			return fmt.Errorf("headers: %q; err: %w", req.Header, err)
-		}
-		return nil
+	ce := req.Header.Get("Content-Encoding")
+	return parser.ParseStream(req.Body, ce, func(series []parser.Series) error {
+		return insertRows(series, extraLabels)
 	})
 }
 
@@ -54,7 +46,12 @@ func insertRows(series []parser.Series, extraLabels []prompbmarshal.Label) error
 		rowsTotal += len(ss.Points)
 		ctx.Labels = ctx.Labels[:0]
 		ctx.AddLabel("", ss.Metric)
-		ctx.AddLabel("host", ss.Host)
+		if ss.Host != "" {
+			ctx.AddLabel("host", ss.Host)
+		}
+		if ss.Device != "" {
+			ctx.AddLabel("device", ss.Device)
+		}
 		for _, tag := range ss.Tags {
 			name, value := parser.SplitTag(tag)
 			if name == "host" {

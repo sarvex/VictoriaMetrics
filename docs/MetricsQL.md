@@ -73,12 +73,16 @@ The list of MetricsQL features:
 * The duration suffix is optional. The duration is in seconds if the suffix is missing.
   For example, `rate(m[300] offset 1800)` is equivalent to `rate(m[5m]) offset 30m`.
 * The duration can be placed anywhere in the query. For example, `sum_over_time(m[1h]) / 1h` is equivalent to `sum_over_time(m[1h]) / 3600`.
+* Numeric values can have `K`, `Ki`, `M`, `Mi`, `G`, `Gi`, `T` and `Ti` suffixes. For example, `8K` is equivalent to `8000`, while `1.2Mi` is equvalent to `1.2*1024*1024`.
 * Trailing commas on all the lists are allowed - label filters, function args and with expressions.
   For instance, the following queries are valid: `m{foo="bar",}`, `f(a, b,)`, `WITH (x=y,) x`.
   This simplifies maintenance of multi-line queries.
-* Metric names and metric labels may contain escaped chars. For instance, `foo\-bar{baz\=aa="b"}` is valid expression.
+* Metric names and label names may contain any unicode letter. For example `температура{город="Киев"}` is a value MetricsQL expression.
+* Metric names and labels names may contain escaped chars. For example, `foo\-bar{baz\=aa="b"}` is valid expression.
   It returns time series with name `foo-bar` containing label `baz=aa` with value `b`.
-  Additionally, `\xXX` escape sequence is supported, where `XX` is hexadecimal representation of escaped char.
+  Additionally, the following escape sequences are supported:
+  - `\xXX`, where `XX` is hexadecimal representation of the escaped ascii char.
+  - `\uXXXX`, where `XXXX` is a hexadecimal representation of the escaped unicode char.
 * Aggregate functions support optional `limit N` suffix in order to limit the number of output series.
   For example, `sum(x) by (y) limit 3` limits the number of output time series after the aggregation to 3.
   All the other time series are dropped.
@@ -89,7 +93,7 @@ The list of MetricsQL features:
 * `if` binary operator. `q1 if q2` removes values from `q1` for missing values from `q2`.
 * `ifnot` binary operator. `q1 ifnot q2` removes values from `q1` for existing values from `q2`.
 * `WITH` templates. This feature simplifies writing and managing complex queries.
-  Go to [WITH templates playground](https://play.victoriametrics.com/promql/expand-with-exprs) and try it.
+  Go to [WITH templates playground](https://play.victoriametrics.com/select/accounting/1/6a716b0f-38bc-4856-90ce-448fd713e3fe/expand-with-exprs) and try it.
 * String literals may be concatenated. This is useful with `WITH` templates:
   `WITH (commonPrefix="long_metric_prefix_") {__name__=commonPrefix+"suffix1"} / {__name__=commonPrefix+"suffix2"}`.
 * `keep_metric_names` modifier can be applied to all the [rollup functions](#rollup-functions) and [transform functions](#transform-functions).
@@ -395,7 +399,7 @@ over the given lookbehind window `d` using the given smoothing factor `sf` and t
 Both `sf` and `tf` must be in the range `[0...1]`. It is expected that the [series_selector](https://docs.victoriametrics.com/keyConcepts.html#filtering)
 returns time series of [gauge type](https://docs.victoriametrics.com/keyConcepts.html#gauge).
 
-This function is supported by PromQL.
+This function is supported by PromQL. See also [range_linear_regression](#range_linear_regression).
 
 #### idelta
 
@@ -533,7 +537,7 @@ from the given [series_selector](https://docs.victoriametrics.com/keyConcepts.ht
 linear interpolation over raw samples on the given lookbehind window `d`. The predicted value is calculated individually per each time series
 returned from the given [series_selector](https://docs.victoriametrics.com/keyConcepts.html#filtering).
 
-This function is supported by PromQL.
+This function is supported by PromQL. See also [range_linear_regression](#range_linear_regression).
 
 #### present_over_time
 
@@ -1051,6 +1055,8 @@ See also [histogram_quantile](#histogram_quantile).
 `histogram_share(le, buckets)` is a [transform function](#transform-functions), which calculates the share (in the range `[0...1]`)
 for `buckets` that fall below `le`. This function is useful for calculating SLI and SLO. This is inverse to [histogram_quantile](#histogram_quantile).
 
+The function accepts optional third arg - `boundsLabel`. In this case it returns `lower` and `upper` bounds for the estimated share with the given `boundsLabel` label.
+
 #### histogram_stddev
 
 `histogram_stddev(buckets)` is a [transform function](#transform-functions), which calculates standard deviation for the given `buckets`.
@@ -1203,6 +1209,11 @@ See also [rand](#rand) and [rand_exponential](#rand_exponential).
 
 `range_last(q)` is a [transform function](#transform-functions), which returns the value for the last point per each time series returned by `q`.
 
+#### range_linear_regression
+
+`range_linear_regression(q)` is a [transform function](#transform-functions), which calculates [simple linear regression](https://en.wikipedia.org/wiki/Simple_linear_regression)
+over the selected time range per each time series returned by `q`. This function is useful for capacity planning and predictions.
+
 #### range_max
 
 `range_max(q)` is a [transform function](#transform-functions), which calculates the max value across points per each time series returned by `q`.
@@ -1215,14 +1226,34 @@ See also [rand](#rand) and [rand_exponential](#rand_exponential).
 
 `range_min(q)` is a [transform function](#transform-functions), which calculates the min value across points per each time series returned by `q`.
 
+#### range_normalize
+
+`range_normalize(q1, ...)` is a [transform function](#transform-functions), which normalizes values for time series returned by `q1, ...` into `[0 ... 1]` range.
+This function is useful for correlating time series with distinct value ranges.
+
 #### range_quantile
 
 `range_quantile(phi, q)` is a [transform function](#transform-functions), which returns `phi`-quantile across points per each time series returned by `q`.
 `phi` must be in the range `[0...1]`.
 
+#### range_stddev
+
+`range_stddev(q)` is a [transform function](#transform-functions), which calculates [standard deviation](https://en.wikipedia.org/wiki/Standard_deviation)
+per each time series returned by `q` on the selected time range.
+
+#### range_stdvar
+
+`range_stdvar(q)` is a [transform function](#transform-functions), which calculates [standard variance](https://en.wikipedia.org/wiki/Variance)
+per each time series returned by `q` on the selected time range.
+
 #### range_sum
 
 `range_sum(q)` is a [transform function](#transform-functions), which calculates the sum of points per each time series returned by `q`.
+
+#### range_trim_spikes
+
+`range_trim_spikes(phi, q)` is a [transform function](#transform-functions), which drops `phi` percent of biggest spikes from time series returned by `q`.
+The `phi` must be in the range `[0..1]`, where `0` means `0%` and `1` means `100%`.
 
 #### remove_resets
 
